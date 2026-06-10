@@ -36,6 +36,15 @@ flowchart LR
 | **CriticAgent** | researcher output | `"critic_notes": ["...", ...]` |
 | **WriterAgent** | critic output | `"final_answer": "..."` (markdown) |
 
+## Demo
+
+
+
+https://github.com/user-attachments/assets/75a2b095-9ecd-4086-8758-c6ac817943d1
+
+
+
+
 The orchestrator lives in `src/main.py`. Agent classes are in `src/agents.py`. Request/response models are in `src/models.py`.
 
 ### Data evolution (example)
@@ -214,8 +223,6 @@ pytest -v
 - CI/CD via GitHub Actions
 - `/health` liveness endpoint
 
-### What is pending
-- Demo video (3–5 min walkthrough of setup, run, and output)
 
 ### What can be improved
 - Add async execution so independent agents can run in parallel
