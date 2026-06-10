@@ -1,10 +1,10 @@
 ﻿# Multi-Agent FastAPI Demo
 
-A small FastAPI app that runs a task through four simple Python agents in sequence. Each agent receives a structured dict, adds to it, and the API returns the final answer plus a trace of every step.
+A small FastAPI app that runs a task through four Python agents in sequence, each powered by **Mistral via OpenRouter**. Each agent receives a structured dict, enriches it with LLM-generated content, and passes it to the next. The API returns the final answer plus a full trace of every step.
 
 ## How it works
 
-The app is a **linear pipeline**: one HTTP request runs four agents in order. Each agent takes a dict, enriches it, and passes it to the next. There is no LLM or external API—each agent uses plain Python string logic.
+The app is a **linear pipeline**: one HTTP request runs four agents in order. Each agent calls Mistral to do real work — planning, researching, reviewing, and writing.
 
 ```mermaid
 flowchart LR
@@ -19,10 +19,10 @@ flowchart LR
 ### Flow
 
 1. Client sends `{ "task": "..." }` to `POST /run-task`.
-2. **PlannerAgent** breaks the task into 2–3 actionable steps.
-3. **ResearcherAgent** adds simple research notes for each step.
-4. **CriticAgent** reviews the plan and research, and adds review notes.
-5. **WriterAgent** assembles everything into a markdown `final_answer`.
+2. **PlannerAgent** uses Mistral to break the task into 3 actionable steps.
+3. **ResearcherAgent** uses Mistral to add 2 research notes per step.
+4. **CriticAgent** uses Mistral to review the plan and research, adding review notes.
+5. **WriterAgent** uses Mistral to assemble everything into a markdown `final_answer`.
 6. The API returns `final_answer` plus a `trace` of every agent step.
 
 `GET /health` returns `{"status": "ok"}` for a simple liveness check.
@@ -46,9 +46,9 @@ The orchestrator lives in `src/main.py`. Agent classes are in `src/agents.py`. R
 {
   "task": "Explain how to set up a simple FastAPI project",
   "steps": [
-    "Analyze scope: Explain how to set up",
-    "Address remaining aspects: a simple FastAPI project",
-    "Synthesize findings into a final answer"
+    "Install FastAPI and uvicorn using pip",
+    "Create a main.py file and define your first route",
+    "Run the development server and test via /docs"
   ]
 }
 ```
@@ -78,6 +78,23 @@ agent-to-agent-communication/
 ```bash
 pip install -r requirements.txt
 ```
+
+## Environment setup
+
+Copy `.env.example` to `.env` and fill in your OpenRouter API key:
+
+```bash
+cp .env.example .env
+```
+
+`.env.example`:
+```
+OPENROUTER_API_KEY=your_openrouter_api_key_here
+OPENROUTER_URL=https://openrouter.ai/api/v1/chat/completions
+GPT_MODEL=mistralai/mistral-small-3.2-24b-instruct
+```
+
+Get a free API key at [openrouter.ai](https://openrouter.ai).
 
 ## Run dev server
 
@@ -109,7 +126,7 @@ Response shape:
 
 ```json
 {
-  "final_answer": "# Response to: Explain how to set up a simple FastAPI project\n\n## Plan\n1. Analyze scope: Explain how to set up\n2. Address remaining aspects: a simple FastAPI project\n3. Synthesize findings into a final answer\n\n## Research\n**Analyze scope: Explain how to set up**\n  - Context note: 'Explain how to set up' relates to common best practices.\n  - Detail: consider constraints and audience when handling 'Explain how to set up'.\n\n## Review\n- Review: plan and research look complete; proceed to writing.\n\n## Summary\nBased on the plan, research, and review, here is the answer: Explain how to set up a simple FastAPI project can be addressed by following the steps above with attention to the noted constraints.",
+  "final_answer": "## Setting Up a Simple FastAPI Project\n\nTo get started with FastAPI...",
   "trace": [
     {
       "agent_name": "PlannerAgent",
@@ -190,18 +207,19 @@ pytest -v
 
 ### What is complete
 - Four-agent linear pipeline (Planner → Researcher → Critic → Writer)
+- Each agent powered by Mistral (`mistral-small-3.2-24b-instruct`) via OpenRouter
 - FastAPI with typed Pydantic request/response models
 - Full trace returned per request for debugging and auditing
-- 28 passing tests covering endpoints, agent order, output keys, branching logic, and edge cases
+- 28 tests covering endpoints, agent order, output keys, branching logic, and edge cases
 - CI/CD via GitHub Actions
 - `/health` liveness endpoint
 
 ### What is pending
-- No environment variables currently required (no external APIs used)
+- Demo video (3–5 min walkthrough of setup, run, and output)
 
 ### What can be improved
-- Replace stub string-manipulation agents with real LLM calls (e.g. Claude or OpenAI API) for genuinely intelligent responses
 - Add async execution so independent agents can run in parallel
 - Add memory so agents can reference context from previous tasks
 - Add streaming responses so the client sees output as each agent finishes
 - Add authentication to the `/run-task` endpoint for production use
+- Mock LLM calls in tests so they run offline and don't hit the API
