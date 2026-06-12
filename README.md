@@ -36,7 +36,7 @@ flowchart LR
 | **CriticAgent** | researcher output | `"critic_notes": ["...", ...]` |
 | **WriterAgent** | critic output | `"final_answer": "..."` (markdown) |
 
-## Demo
+## Watch Demo
 
 
 
