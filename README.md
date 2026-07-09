@@ -40,9 +40,9 @@ flowchart TD
 | Agent | Input | Adds to the dict |
 |-------|-------|------------------|
 | **PlannerAgent** | `{ "task": "..." }` | `"steps": ["...", "..."]` |
-| **ResearcherAgent** | planner output (or critic feedback, on a revision pass) | `"research": { step: [details...] }` |
-| **CriticAgent** | researcher output | `"critic_decision": "approve" \| "revise"`, `"critic_notes": ["...", ...]` |
-| **WriterAgent** | final approved (or max-revision) output | `"final_answer": "..."` (markdown), `"improvement_note": "..."` |
+| **ResearcherAgent** | planner output | `"research": { step: [details...] }` |
+| **CriticAgent** | researcher output | `"critic_notes": ["...", ...]` |
+| **WriterAgent** | critic output | `"final_answer": "..."` (markdown) |
 
 The orchestrator (including the revision loop) lives in `src/main.py`. Agent classes are in `src/agents.py`. Request/response models are in `src/models.py`.
 
@@ -188,8 +188,7 @@ pytest -v
 - `/health` liveness endpoint
 
 ### What is pending
-- Demo video (3–5 min walkthrough of setup, run, and output — should show a case where the Critic revises at least once)
-- Test suite update to match the new decision-driven, variable-length trace (see note above)
+- Demo video (3–5 min walkthrough of setup, run, and output)
 
 ### What can be improved
 - Add async execution so independent research steps can run in parallel
