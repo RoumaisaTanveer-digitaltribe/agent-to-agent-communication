@@ -13,4 +13,5 @@ class AgentStep(BaseModel):
 
 class TaskResponse(BaseModel):
     final_answer: str
+    improvement_note: str
     trace: list[AgentStep]

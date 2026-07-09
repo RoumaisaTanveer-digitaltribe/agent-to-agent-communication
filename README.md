@@ -1,29 +1,37 @@
 ﻿# Multi-Agent FastAPI Demo
 
-A small FastAPI app that runs a task through four Python agents in sequence, each powered by **Mistral via OpenRouter**. Each agent receives a structured dict, enriches it with LLM-generated content, and passes it to the next. The API returns the final answer plus a full trace of every step.
+A small FastAPI app that runs a task through four Python agents, each powered by **Mistral via OpenRouter**. Each agent receives a structured dict, enriches it with LLM-generated content, and passes it to the next. Unlike a fixed linear pipeline, the **Critic makes a real approve/revise decision** that controls whether the Researcher runs again — the flow branches based on the model's own judgment, not hardcoded rules. The API returns the final answer, an improvement note, and a full trace of every step.
 
 ## How it works
 
-The app is a **linear pipeline**: one HTTP request runs four agents in order. Each agent calls Mistral to do real work — planning, researching, reviewing, and writing.
+One HTTP request runs Planner → Researcher → Critic, then loops back to Researcher if the Critic says "revise" (up to a capped number of times), before finally reaching the Writer. Every agent calls Mistral to do real work — nothing about *what* each agent produces is scripted; only the *routing* between Researcher/Critic is orchestrated in code.
 
 ```mermaid
-flowchart LR
+flowchart TD
     A[Client POST /run-task] --> B[PlannerAgent]
     B --> C[ResearcherAgent]
     C --> D[CriticAgent]
-    D --> E[WriterAgent]
+    D -->|decision: approve| E[WriterAgent]
+    D -->|decision: revise, under max| C2[ResearcherAgent - revised]
+    C2 --> D2[CriticAgent]
+    D2 -->|decision: approve| E
+    D2 -->|decision: revise, under max| C2
+    D2 -->|max revisions reached| E
     E --> F[TaskResponse]
-    F --> G[final_answer + trace]
+    F --> G[final_answer + improvement_note + trace]
 ```
 
 ### Flow
 
-1. Client sends `{ "task": "..." }` to `POST /run-task`.
-2. **PlannerAgent** uses Mistral to break the task into 3 actionable steps.
-3. **ResearcherAgent** uses Mistral to add 2 research notes per step.
-4. **CriticAgent** uses Mistral to review the plan and research, adding review notes.
-5. **WriterAgent** uses Mistral to assemble everything into a markdown `final_answer`.
-6. The API returns `final_answer` plus a `trace` of every agent step.
+1. Client sends `{ "task": "..." }` to `POST /run-task`. FastAPI/Pydantic reject invalid input (empty string, missing field, non-string) with a 422 before any agent runs.
+2. **PlannerAgent** calls Mistral to break the task into exactly 3 actionable steps.
+3. **ResearcherAgent** calls Mistral once per step, adding 2 research notes per step.
+4. **CriticAgent** calls Mistral and requires its reply to start with a literal `APPROVE` or `REVISE`, followed by 1-2 short review notes. This decision — not any Python logic — controls what happens next.
+5. **Decision point:**
+   - If `APPROVE` → go straight to Writer.
+   - If `REVISE` → **ResearcherAgent runs again**, this time also given the Critic's specific feedback, producing new research that addresses it. CriticAgent then reviews again. This can repeat up to `MAX_REVISIONS` times (currently 2) before forcing a move to Writer regardless, so the loop can never run forever.
+6. **WriterAgent** calls Mistral twice: once to write the final markdown `final_answer`, and once to produce a short `improvement_note` explaining how the final answer reflects the Critic's feedback.
+7. The API returns `final_answer`, `improvement_note`, and a full `trace` of every step — including every revision pass, if any occurred.
 
 `GET /health` returns `{"status": "ok"}` for a simple liveness check.
 
@@ -32,13 +40,17 @@ flowchart LR
 | Agent | Input | Adds to the dict |
 |-------|-------|------------------|
 | **PlannerAgent** | `{ "task": "..." }` | `"steps": ["...", "..."]` |
-| **ResearcherAgent** | planner output | `"research": { step: [details...] }` |
-| **CriticAgent** | researcher output | `"critic_notes": ["...", ...]` |
-| **WriterAgent** | critic output | `"final_answer": "..."` (markdown) |
+| **ResearcherAgent** | planner output (or critic feedback, on a revision pass) | `"research": { step: [details...] }` |
+| **CriticAgent** | researcher output | `"critic_decision": "approve" \| "revise"`, `"critic_notes": ["...", ...]` |
+| **WriterAgent** | final approved (or max-revision) output | `"final_answer": "..."` (markdown), `"improvement_note": "..."` |
 
-The orchestrator lives in `src/main.py`. Agent classes are in `src/agents.py`. Request/response models are in `src/models.py`.
+The orchestrator (including the revision loop) lives in `src/main.py`. Agent classes are in `src/agents.py`. Request/response models are in `src/models.py`.
 
-### Data evolution (example)
+### State vs. memory
+
+Each agent is **stateless** on its own — every call to Mistral is a fresh system+user exchange with no private conversation history. What drives the revision loop is **orchestration state** in `main.py`: a revision counter and a dict that keeps growing, explicitly passed to each agent. This is a deliberate choice: every piece of context any agent used is visible in the `data` dict and the `trace`, rather than hidden inside an agent's internal memory — which keeps the whole run auditable end-to-end.
+
+### Data evolution (example — no revision needed)
 
 **After Planner:**
 
@@ -53,18 +65,18 @@ The orchestrator lives in `src/main.py`. Agent classes are in `src/agents.py`. R
 }
 ```
 
-Each later agent keeps prior fields and adds its own (`research`, then `critic_notes`, then `final_answer`). The `trace` in the response records each agent's `input` and `output` for debugging and auditing.
+Each later agent keeps prior fields and adds its own (`research`, then `critic_decision`/`critic_notes`, then `final_answer`/`improvement_note`). The `trace` in the response records each agent's `input` and `output` for debugging and auditing — including a `"ResearcherAgent (revised)"` entry for every extra pass triggered by a `revise` decision.
 
 ## Project structure
 
 ```
 agent-to-agent-communication/
 ├── src/
-│   ├── main.py        # FastAPI app and pipeline orchestration
+│   ├── main.py        # FastAPI app, pipeline orchestration, and the revision loop
 │   ├── agents.py      # PlannerAgent, ResearcherAgent, CriticAgent, WriterAgent
 │   └── models.py      # Pydantic models: TaskRequest, AgentStep, TaskResponse
 ├── tests/
-│   └── test_agents.py # 28 tests covering endpoints and unit logic
+│   └── test_agents.py # tests covering endpoints and unit logic
 ├── .github/
 │   └── workflows/     # CI/CD via GitHub Actions
 ├── .env.example
@@ -122,11 +134,12 @@ Request body:
 }
 ```
 
-Response shape:
+Response shape (example where the Critic approved on the first pass — no revision needed):
 
 ```json
 {
   "final_answer": "## Setting Up a Simple FastAPI Project\n\nTo get started with FastAPI...",
+  "improvement_note": "The final answer incorporates the critic's note about including error handling by adding a short troubleshooting section.",
   "trace": [
     {
       "agent_name": "PlannerAgent",
@@ -141,16 +154,18 @@ Response shape:
     {
       "agent_name": "CriticAgent",
       "input": { "...": "..." },
-      "output": { "...": "...", "critic_notes": ["..."] }
+      "output": { "...": "...", "critic_decision": "approve", "critic_notes": ["..."] }
     },
     {
       "agent_name": "WriterAgent",
       "input": { "...": "..." },
-      "output": { "...": "...", "final_answer": "..." }
+      "output": { "...": "...", "final_answer": "...", "improvement_note": "..." }
     }
   ]
 }
 ```
+
+If the Critic instead returns `"critic_decision": "revise"`, the trace will contain extra `"ResearcherAgent (revised)"` and `"CriticAgent"` entries before the final `"WriterAgent"` entry — the trace length is not fixed at 4, since it reflects however many passes the Critic's own judgment required (capped at `MAX_REVISIONS`).
 
 ## Run tests
 
@@ -158,68 +173,27 @@ Response shape:
 pytest -v
 ```
 
-### Test coverage — 28 tests
-
-**Endpoint tests: `POST /run-task`**
-
-| # | Test | What it checks |
-|---|------|----------------|
-| 1 | `test_run_task_returns_final_answer_and_full_trace` | Full happy path — status 200, all 4 agents in trace |
-| 2 | `test_run_task_rejects_empty_task` | Empty string → 422 validation error |
-| 3 | `test_run_task_rejects_missing_task_field` | Missing field entirely → 422 |
-| 4 | `test_run_task_rejects_non_string_task` | Integer instead of string → 422 |
-| 5 | `test_run_task_trace_has_correct_agent_order` | Agents fire in Planner→Researcher→Critic→Writer order |
-| 6 | `test_run_task_final_answer_contains_task` | Original task text echoed in final answer |
-| 7 | `test_run_task_with_short_task` | ≤4 word task takes short-task branch in Planner |
-| 8 | `test_run_task_with_long_task` | >4 word task takes long-task branch, produces 3 steps |
-| 9 | `test_run_task_final_answer_contains_plan_section` | `## Plan` section present in output |
-| 10 | `test_run_task_final_answer_contains_research_section` | `## Research` section present |
-| 11 | `test_run_task_final_answer_contains_review_section` | `## Review` section present |
-| 12 | `test_run_task_final_answer_contains_summary_section` | `## Summary` section present |
-| 13 | `test_run_task_planner_output_has_steps_key` | Planner trace output contains `steps` list |
-| 14 | `test_run_task_researcher_output_has_research_key` | Researcher trace output contains `research` dict |
-| 15 | `test_run_task_critic_output_has_notes_key` | Critic trace output contains `critic_notes` list |
-| 16 | `test_run_task_writer_output_has_final_answer_key` | Writer trace output contains `final_answer` |
-
-**Endpoint tests: `GET /health`**
-
-| # | Test | What it checks |
-|---|------|----------------|
-| 17 | `test_health_endpoint` | Returns `{"status": "ok"}` with status 200 |
-| 18 | `test_health_endpoint_method_not_allowed` | POST on `/health` → 405 |
-
-**Unit tests: individual agents**
-
-| # | Test | What it checks |
-|---|------|----------------|
-| 19 | `test_planner_short_task_produces_three_steps` | ≤4 word input → 3 steps |
-| 20 | `test_planner_long_task_produces_three_steps` | >4 word input → 3 steps |
-| 21 | `test_planner_output_contains_task_key` | Planner preserves original `task` key |
-| 22 | `test_researcher_adds_two_details_per_step` | Exactly 2 detail strings per step |
-| 23 | `test_researcher_preserves_existing_keys` | Researcher keeps `task` and `steps` from prior output |
-| 24 | `test_critic_adds_note_for_very_short_task` | Task < 10 chars triggers short-task warning note |
-| 25 | `test_critic_flags_missing_research_coverage` | Steps with no research → gap note added |
-| 26 | `test_critic_clean_run_produces_proceed_note` | Complete plan + research → "proceed" note |
-| 27 | `test_writer_final_answer_is_string` | Final answer is a non-empty string |
-| 28 | `test_writer_final_answer_starts_with_response_header` | Output starts with `# Response to: {task}` |
+> **Note:** some existing tests assert exact trace length (`== 4`) or specific literal wording in agent output (e.g. `"gap"`, `"proceed"`, `"## Plan"`). These were written against earlier, more deterministic agent behavior. Now that the Critic makes a real approve/revise decision and the Researcher/Critic can loop, trace length varies and exact wording is no longer guaranteed — these tests may need to be rewritten to check structure (e.g. "trace contains all required agent roles in order," "critic_decision is one of approve/revise") rather than exact strings or counts.
 
 ## Status
 
 ### What is complete
-- Four-agent linear pipeline (Planner → Researcher → Critic → Writer)
+- Planner → Researcher → Critic loop → Writer pipeline, with the Critic's own `approve`/`revise` decision controlling whether Researcher runs again
 - Each agent powered by Mistral (`mistral-small-3.2-24b-instruct`) via OpenRouter
 - FastAPI with typed Pydantic request/response models
-- Full trace returned per request for debugging and auditing
-- 28 tests covering endpoints, agent order, output keys, branching logic, and edge cases
+- Full trace returned per request, including every revision pass, for debugging and auditing
+- Capped revision loop (`MAX_REVISIONS`) so the pipeline can't run forever
+- `improvement_note` explicitly explaining how the final answer changed after review
 - CI/CD via GitHub Actions
 - `/health` liveness endpoint
 
 ### What is pending
-- Demo video (3–5 min walkthrough of setup, run, and output)
+- Demo video (3–5 min walkthrough of setup, run, and output — should show a case where the Critic revises at least once)
+- Test suite update to match the new decision-driven, variable-length trace (see note above)
 
 ### What can be improved
-- Add async execution so independent agents can run in parallel
-- Add memory so agents can reference context from previous tasks
+- Add async execution so independent research steps can run in parallel
+- Add per-agent memory so an agent could reference its own past reasoning directly, instead of relying on the orchestrator to pass context forward
 - Add streaming responses so the client sees output as each agent finishes
 - Add authentication to the `/run-task` endpoint for production use
 - Mock LLM calls in tests so they run offline and don't hit the API

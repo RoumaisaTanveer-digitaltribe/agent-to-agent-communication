@@ -64,15 +64,31 @@ class PlannerAgent:
 
 
 class ResearcherAgent:
-    """Adds real research details per step using Mistral."""
+    """Adds real research details per step using Mistral.
+
+    If `critic_feedback` is present in the incoming data (i.e. this is a
+    revision pass triggered by the Critic), it's included in the prompt so
+    the new research actually responds to what was flagged, instead of
+    just repeating the same notes.
+    """
 
     def run(self, data: dict) -> dict:
         research: dict[str, list[str]] = {}
+        feedback = data.get("critic_feedback")
+        feedback_text = ""
+        if feedback:
+            feedback_text = (
+                "\n\nThe previous research was reviewed and needs improvement. "
+                "Address this feedback specifically:\n" + "\n".join(f"- {f}" for f in feedback)
+            )
 
         for step in data["steps"]:
             raw = call_llm(
                 system="You are a research assistant. Output exactly 2 bullet points starting with -. Nothing else.",
-                user=f"Give 2 short research notes (1 sentence each) for this step:\n\nStep: {step}\nTask: {data['task']}",
+                user=(
+                    f"Give 2 short research notes (1 sentence each) for this step:\n\n"
+                    f"Step: {step}\nTask: {data['task']}{feedback_text}"
+                ),
             )
 
             details = []
@@ -83,11 +99,15 @@ class ResearcherAgent:
 
             research[step] = details[:2] if details else [f"Research note for: {step}"]
 
-        return {**data, "research": research}
+        result = {**data, "research": research}
+        result.pop("critic_feedback", None)  # consumed, don't carry forward
+        return result
 
 
 class CriticAgent:
-    """Reviews the plan and research using Mistral."""
+    """Reviews the plan and research using Mistral, and makes a real
+    approve/revise decision that the orchestrator acts on.
+    """
 
     def run(self, data: dict) -> dict:
         steps_text = "\n".join(f"- {s}" for s in data["steps"])
@@ -97,24 +117,39 @@ class CriticAgent:
         )
 
         raw = call_llm(
-            system="You are a critical reviewer. Output only 1-2 short bullet points starting with -. No intro text.",
-            user=f"Review this plan and research. Give 1-2 short review notes.\n\nTask: {data['task']}\nSteps:\n{steps_text}\nResearch:\n{research_text}",
+            system=(
+                "You are a critical reviewer. Your FIRST line must be exactly one "
+                "word: APPROVE or REVISE. Then output 1-2 short bullet points "
+                "starting with -, explaining your decision. No other text."
+            ),
+            user=(
+                f"Review this plan and research. Decide APPROVE if it is solid "
+                f"and ready to write up, or REVISE if it is missing something "
+                f"important (e.g. risks, concrete examples, key considerations).\n\n"
+                f"Task: {data['task']}\nSteps:\n{steps_text}\nResearch:\n{research_text}"
+            ),
         )
 
+        lines = [l.strip() for l in raw.strip().splitlines() if l.strip()]
+        decision = "revise" if lines and lines[0].upper().startswith("REVISE") else "approve"
+
         notes = []
-        for line in raw.strip().splitlines():
-            line = line.strip().lstrip("-• ").strip()
+        for line in lines[1:]:
+            line = line.lstrip("-• ").strip()
             if line:
                 notes.append(line)
 
         if not notes:
-            notes = ["Plan and research look complete; proceed to writing."]
+            notes = ["Plan and research look complete; proceed to writing."] if decision == "approve" \
+                else ["Needs more depth; please revise."]
 
-        return {**data, "critic_notes": notes[:3]}
+        return {**data, "critic_decision": decision, "critic_notes": notes[:3]}
 
 
 class WriterAgent:
-    """Writes the final response using Mistral."""
+    """Writes the final response using Mistral, and explains what changed
+    after critic review.
+    """
 
     def run(self, data: dict) -> dict:
         steps_text = "\n".join(f"{i+1}. {s}" for i, s in enumerate(data["steps"]))
@@ -140,4 +175,12 @@ Review notes:
 {critic_text}""",
         )
 
-        return {**data, "final_answer": final_answer}
+        improvement_note = call_llm(
+            system="You are summarizing what changed in a document after review. Reply in 1-2 sentences, plain text, no markdown.",
+            user=(
+                f"The critic gave this feedback during review:\n{critic_text}\n\n"
+                f"Briefly explain how the final answer reflects or addresses that feedback."
+            ),
+        )
+
+        return {**data, "final_answer": final_answer, "improvement_note": improvement_note}
